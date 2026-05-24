@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>JS-POSIX Quantum Master OS (v10.3 - POSIX Hardened)</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #020a02;
+            --phosphor-color: #33ff33;
+            --phosphor-dim: #11aa11;
+            --glow-strength: 0 0 8px rgba(51, 255, 51, 0.65);
+        }
+
+        * { box-sizing: border-box; }
+
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: var(--bg-color);
+            font-family: 'VT323', monospace; font-size: 21px;
+            color: var(--phosphor-color); text-shadow: var(--glow-strength);
+            overflow: hidden;
+        }
+
+        body::before {
+            content: " "; display: block; position: fixed;
+            top: 0; left: 0; bottom: 0; right: 0;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), 
+                        linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+            z-index: 2147483647; background-size: 100% 4px, 6px 100%; pointer-events: none;
+        }
+
+        #terminal-container {
+            width: 100%; height: 100%; padding: 20px;
+            display: flex; flex-direction: column;
+            overflow-y: auto; scroll-behavior: smooth;
+        }
+
+        #scrollback { white-space: pre-wrap; word-break: break-all; line-height: 1.2; }
+        #input-line { display: flex; align-items: center; width: 100%; margin-top: 4px; }
+        #prompt { white-space: pre; color: var(--phosphor-color); margin-right: 8px; }
+        
+        #cmd-input {
+            flex: 1; background: transparent; border: none; outline: none;
+            color: var(--phosphor-color); font-family: 'VT323', monospace; font-size: 21px;
+            text-shadow: var(--glow-strength); caret-color: transparent;
+            user-select: none; /* Prevents selection artifacts inside active input buffers */
+        }
+
+        #cursor {
+            display: inline-block; width: 10px; height: 18px;
+            background-color: var(--phosphor-color); box-shadow: var(--glow-strength);
+            vertical-align: middle; animation: blink 1s infinite;
+            position: absolute; pointer-events: none;
+        }
+
+        @keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: var(--bg-color); }
+        ::-webkit-scrollbar-thumb { background: var(--phosphor-dim); }
+
+        /* Custom tactical selection mask override */
+::selection {
+    background-color: var(--phosphor-color) !important; /* Intense green background */
+    color: var(--bg-color) !important;              /* Solid black text */
+    text-shadow: none !important;                     /* Kills glow matrix for crisp legibility */
+}
+
+/* Webkit specific compatibility rules */
+::-moz-selection {
+    background-color: var(--phosphor-color) !important;
+    color: var(--bg-color) !important;
+    text-shadow: none !important;
+}
+    </style>
+</head>
+<body>
+
+<div id="terminal-container" onclick="focusInput()">
+    <div id="scrollback"></div>
+    <div id="input-line">
+        <span id="prompt"></span>
+        <div style="position: relative; flex: 1; display: flex; align-items: center;">
+            <input type="text" id="cmd-input" autofocus autocomplete="off" autocapitalize="none" spellcheck="false">
+            <div id="cursor"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+// --- VIRTUAL FILE SYSTEM (VFS) MODULE ---
+class VirtualFileSystem {
+    constructor() { this.root = { type: 'dir', children: {} }; }
+
+    normalizePath(currentDir, targetPath) {
+        if (!targetPath) return currentDir;
+        let absolute = targetPath.startsWith('/') ? targetPath : '';
+        if (!absolute) {
+            absolute = currentDir === '/' ? '/' + targetPath : currentDir + '/' + targetPath;
+        } else { absolute = targetPath; }
+        const segments = absolute.split('/');
+        const stack = [];
+        for (const seg of segments) {
+            if (seg === '' || seg === '.') continue;
+            if (seg === '..') { if (stack.length > 0) stack.pop(); }
+            else { stack.push(seg); }
+        }
+        return '/' + stack.join('/');
+    }
+
+    getNode(currentDir, path) {
+        const absolute = this.normalizePath(currentDir, path);
+        if (absolute === '/') return this.root;
+        const segments = absolute.split('/').filter(Boolean);
+        let curr = this.root;
+        for (const seg of segments) {
+            if (curr.type !== 'dir' || !curr.children[seg]) return null;
+            curr = curr.children[seg];
+        }
+        return curr;
+    }
+
+    mkdir(currentDir, path) {
+        const absolute = this.normalizePath(currentDir, path);
+        const segments = absolute.split('/').filter(Boolean);
+        let curr = this.root;
+        for (const seg of segments) {
+            if (!curr.children[seg]) {
+                curr.children[seg] = { type: 'dir', children: {} };
+            } else if (curr.children[seg].type !== 'dir') { return false; }
+            curr = curr.children[seg];
+        }
+        this.syncToStorage();
+        return true;
+    }
+
+    writeFile(currentDir, path, content) {
+        const absolute = this.normalizePath(currentDir, path);
+        const segments = absolute.split('/').filter(Boolean);
+        const fileName = segments.pop();
+        if (!fileName) return false;
+
+        let curr = this.root;
+        for (const seg of segments) {
+            if (!curr.children[seg]) { curr.children[seg] = { type: 'dir', children: {} }; }
+            curr = curr.children[seg];
+        }
+        curr.children[fileName] = { type: 'file', content: content };
+        this.syncToStorage();
+        return true;
+    }
+
+    readFile(currentDir, path) {
+        const node = this.getNode(currentDir, path);
+        return (node && node.type === 'file') ? node.content : null;
+    }
+
+    rm(currentDir, path) {
+        const absolute = this.normalizePath(currentDir, path);
+        const segments = absolute.split('/').filter(Boolean);
+        const target = segments.pop();
+        let curr = this.root;
+        for (const seg of segments) {
+            if (!curr.children[seg]) return false;
+            curr = curr.children[seg];
+        }
+        if (curr.children && curr.children[target]) {
+            delete curr.children[target]; this.syncToStorage(); return true;
+        }
+        return false;
+    }
+
+    readdir(currentDir, path) {
+        const node = this.getNode(currentDir, path);
+        if (node && node.type === 'dir') return Object.keys(node.children);
+        return null;
+    }
+
+    syncToStorage() { localStorage.setItem('js_posix_vfs', JSON.stringify(this.root)); }
+    loadFromStorage() {
+        const stored = localStorage.getItem('js_posix_vfs');
+        if (stored) {
+            try { this.root = JSON.parse(stored); return true; } catch (e) { console.error("VFS Corruption."); }
+        }
+        return false;
+    }
+}
+
+// --- HARDENED OPERATING SYSTEM KERNEL ---
+class Kernel {
+    constructor() {
+        this.vfs = new VirtualFileSystem();
+        this.env = { 'PATH': '/bin', 'USER': 'root', 'HOME': '/home/root', 'PWD': '/home/root', 'SCANLINES': 'off' };
+        this.history = []; this.historyIndex = -1;
+    }
+
+    boot() {
+        if (!this.vfs.loadFromStorage()) { this.bootstrapSystem(); } 
+        else { this.injectCoreBinaries(); }
+        const cachedHistory = this.vfs.readFile('/', '/home/.bash_history');
+        if (cachedHistory) this.history = cachedHistory.split('\n').filter(Boolean);
+    }
+
+    bootstrapSystem() {
+        this.vfs.mkdir('/', '/bin'); this.vfs.mkdir('/', '/etc'); this.vfs.mkdir('/', '/home/root');
+        this.vfs.mkdir('/', '/usr/share/man'); this.vfs.mkdir('/', '/proc');
+
+        this.vfs.writeFile('/', '/etc/issue', 
+` 
+
+
+    
+         
+
+To configure your environment, modify the system banner by executing nano /etc/issue; changes will reflect upon refreshing the tab. Following this, develop your modular command logic by creating scripts within the /bin directory—the designated source of truth for all command execution—and invoke them directly by name. You can further extend the system’s utility by implementing core commands, such as a custom reboot function, to refine your terminal's operational behavior.
+
+The persistence of your terminal environment relies on the browser's localStorage API, which maps your Virtual File System (VFS) to persistent key-value pairs within the browser. Because this storage automatically retains state across sessions, it can become "leaky"—meaning unintended file fragments, corrupted state, or outdated command configurations may persist, potentially causing unexpected behaviors in your JSKonsole environment.
+
+When the system state becomes inconsistent or you need to perform a "factory reset" on your VFS, you can resolve the issue through the browser console:
+
+To purge all VFS data: Execute localStorage.clear() to wipe the persistent storage and reset the environment to its default state.
+
+To debug specific file issues: If only a specific component of the file system is behaving incorrectly, you can identify and remove that specific key using localStorage.removeItem('keyName').
+
+Verification: After clearing the storage, always refresh the browser tab to ensure the environment re-initializes from a clean slate.
+
+Managing the persistence layer in this manner allows you to treat your /bin directory as a dynamic source of truth while maintaining the ability to quickly recover from configuration errors.
+
+To ensure you have a reliable reference for your terminal development, you should save this configuration guide to your VFS. Since your architectural requirement designates /bin as the source of truth for command logic, you should store your documentation files in a /docs or /etc directory to maintain a clean structure.
+
+Configuration Guide & Reference
+Accessing System Config: Use nano /etc/issue to modify your boot screen banner.
+
+Applying Changes: Refresh your browser tab to commit and view updates to your splash screen.
+
+Expanding Functionality: Develop your custom scripts and place them within the /bin directory to enable new terminal commands.
+
+Command Execution: Invoke your scripts directly by typing the filename of your new application within the terminal.
+
+System Hardening: Experiment with implementing essential commands, such as reboot, to refine the behavior of JSKonsole.
+
+Recovery Protocol: If the persistent VFS becomes "leaky" or corrupted, use localStorage.clear() in the browser console to perform a factory reset of your environment.
+
+Type help for available commands.
+
+`);
+
+        this.vfs.writeFile('/', '/etc/rc.local', 
+`# System initialization script
+export USER=root
+export HOME=/home/root
+export PWD=/home/root
+export PATH=/bin
+fetch
+crt off`);
+
+        this.injectCoreBinaries();
+    }
+
+    injectCoreBinaries() {
+        this.vfs.writeFile('/', '/bin/ls', `
+            const files = kernel.vfs.readdir(kernel.env.PWD, args[0] || '.');
+            if (files === null) { output('ls: Path read error.'); return; }
+            output(files.join('    '));
+        `);
+
+        // Upgraded cat: Now accepts input via args OR piped pipeline input
+        this.vfs.writeFile('/', '/bin/cat', `
+            if(args.length === 0 && !kernel.env['PIPE_INPUT']) { output('Usage: cat [file] or stream input'); return; }
+            if(kernel.env['PIPE_INPUT']) { output(kernel.env['PIPE_INPUT']); return; }
+            const content = kernel.vfs.readFile(kernel.env.PWD, args[0]);
+            if(content === null) output('cat: ' + args[0] + ': File not found');
+            else output(content);
+        `);
+
+        // Native POSIX-lite grep simulation binary
+        this.vfs.writeFile('/', '/bin/grep', `
+            if(!args[0]) { output('Usage: grep [match_pattern]'); return; }
+            const search = args[0];
+            const inputData = kernel.env['PIPE_INPUT'] || '';
+            if(!inputData) return;
+            const matches = inputData.split('\\n').filter(line => line.toLowerCase().includes(search.toLowerCase()));
+            if(matches.length > 0) output(matches.join('\\n'));
+        `);
+
+        this.vfs.writeFile('/', '/bin/echo', `output(args.join(' '));`);
+
+        this.vfs.writeFile('/', '/bin/cd', `
+            const target = args[0] || kernel.env.HOME;
+            const node = kernel.vfs.getNode(kernel.env.PWD, target);
+            if(node && node.type === 'dir') {
+                kernel.env.PWD = kernel.vfs.normalizePath(kernel.env.PWD, target);
+            } else { output('cd: no such file or directory: ' + target); }
+        `);
+
+        this.vfs.writeFile('/', '/bin/mkdir', `if(!args[0]) return; kernel.vfs.mkdir(kernel.env.PWD, args[0]);`);
+        this.vfs.writeFile('/', '/bin/rm', `if(!args[0]) return; kernel.vfs.rm(kernel.env.PWD, args[0]);`);
+        
+        this.vfs.writeFile('/', '/bin/export', `
+            if(!args[0] || !args[0].includes('=')) return;
+            const parts = args[0].split('=');
+            kernel.env[parts[0].trim()] = parts.slice(1).join('=').trim();
+        `);
+
+        this.vfs.writeFile('/', '/bin/history', `output(kernel.history.join('\\n'));`);
+        this.vfs.writeFile('/', '/bin/help', `output('POSIX Features Enabled: Sequential Chaining (;), Pipes (|), Redirection (>), Background Exec (&)\\nAvailable utilities: ls, cat, grep, echo, cd, mkdir, rm, export, history, fetch, crt, exec, run, nano');`);
+
+        this.vfs.writeFile('/', '/bin/fetch', `
+            const vfsData = localStorage.getItem('js_posix_vfs') || '{}';
+            const storageUsed = (vfsData.length * 2) / 1024;
+            let totalFiles = 0; let totalDirs = 0;
+            const countNodes = (node) => {
+                if (node.type === 'dir') { totalDirs++; for (const k in node.children) countNodes(node.children[k]); }
+                else if (node.type === 'file') { totalFiles++; }
+            };
+            countNodes(kernel.vfs.root);
+            const customArt = kernel.vfs.readFile('/', '/etc/issue');
+            if (customArt) { output(customArt); }
+            output('---------------------------------------------------');
+            output('OS: JS-POSIX Quantum Engine v10.3 [POSIX-Hardened]');
+            output('USER: ' + kernel.env.USER + '   |   PWD: ' + kernel.env.PWD);
+            output('VFS ALLOCATION: ' + storageUsed.toFixed(2) + ' KB   |   NODES: ' + totalFiles + ' files');
+            output('---------------------------------------------------');
+        `);
+
+        this.vfs.writeFile('/', '/bin/crt', `
+            const flag = args[0]; if (!flag) return;
+            let styleBlock = document.getElementById('crt-style-override');
+            if (flag === 'off') {
+                if (!styleBlock) {
+                    styleBlock = document.createElement('style'); styleBlock.id = 'crt-style-override';
+                    styleBlock.textContent = 'body::before { display: none !important; }';
+                    document.head.appendChild(styleBlock);
+                }
+            } else if (styleBlock) styleBlock.remove();
+        `);
+
+        this.vfs.writeFile('/', '/bin/exec', `
+            if(!args[0]) return;
+            const scriptContent = kernel.vfs.readFile(kernel.env.PWD, args[0]);
+            if(!scriptContent) return;
+            const lines = scriptContent.split('\\n');
+            for(let line of lines) {
+                let trimmed = line.trim();
+                if (trimmed === '' || trimmed.startsWith('#')) continue;
+                kernel.executeCommand(trimmed, output);
+            }
+        `);
+
+        // --- RUN ENGINE ---
+        this.vfs.writeFile('/', '/bin/run', `
+            const filename = args[0]; if(!filename) return;
+            const htmlContent = kernel.vfs.readFile(kernel.env.PWD, filename);
+            if(!htmlContent) return;
+            const overlay = document.createElement('iframe');
+            overlay.style.position = 'fixed'; overlay.style.top = '0'; overlay.style.left = '0';
+            overlay.style.width = '100vw'; overlay.style.height = '100vh'; overlay.style.border = 'none';
+            overlay.style.zIndex = '999999'; document.body.appendChild(overlay);
+            const doc = overlay.contentWindow.document; doc.open(); doc.write(htmlContent); doc.close();
+            const handleEscape = (e) => { if(e.key === 'Escape') { overlay.remove(); window.removeEventListener('keydown', handleEscape); document.getElementById('cmd-input').focus(); } };
+            window.addEventListener('keydown', handleEscape);
+        `);
+
+        // --- NANO VISUAL TEXT EDITOR ---
+        this.vfs.writeFile('/', '/bin/nano', `
+            if(!args[0]) return; const filename = args[0]; let initialContent = kernel.vfs.readFile(kernel.env.PWD, filename) || '';
+            const overlay = document.createElement('div'); overlay.style.position = 'fixed'; overlay.style.top = '0'; overlay.style.left = '0'; overlay.style.width = '100vw'; overlay.style.height = '100vh'; overlay.style.backgroundColor = '#020a02'; overlay.style.color = '#33ff33'; overlay.style.fontFamily = "'VT323', monospace"; overlay.style.fontSize = '21px'; overlay.style.padding = '10px'; overlay.style.display = 'flex'; overlay.style.flexDirection = 'column'; overlay.style.zIndex = '99999';
+            const header = document.createElement('div'); header.style.borderBottom = '1px solid #33ff33'; header.style.paddingBottom = '5px'; header.textContent = 'GNU Nano v10.3 VFS  -  Editing: ' + filename;
+            const textarea = document.createElement('textarea'); textarea.style.flex = '1'; textarea.style.background = 'transparent'; textarea.style.border = 'none'; textarea.style.outline = 'none'; textarea.style.color = '#33ff33'; textarea.style.fontFamily = "'VT323', monospace"; textarea.style.fontSize = '21px'; textarea.style.resize = 'none'; textarea.style.marginTop = '10px'; textarea.value = initialContent;
+            const footer = document.createElement('div'); footer.style.borderTop = '1px solid #33ff33'; footer.style.paddingTop = '5px'; footer.style.fontSize = '18px'; footer.textContent = '^S Save Buffer  |  ESC Save & Exit Workspace';
+            overlay.appendChild(header); overlay.appendChild(textarea); overlay.appendChild(footer); document.body.appendChild(overlay); textarea.focus();
+            const handleShortcuts = (e) => {
+                if (e.ctrlKey && e.key.toLowerCase() === 's') { e.preventDefault(); kernel.vfs.writeFile(kernel.env.PWD, filename, textarea.value); footer.textContent = '[ State committed to storage ]'; setTimeout(() => { footer.textContent = '^S Save Buffer  |  ESC Save & Exit Workspace'; }, 1000); }
+                if (e.key === 'Escape') { e.preventDefault(); kernel.vfs.writeFile(kernel.env.PWD, filename, textarea.value); overlay.remove(); window.removeEventListener('keydown', handleShortcuts); document.getElementById('cmd-input').focus(); output('File written successfully.'); }
+            };
+            window.addEventListener('keydown', handleShortcuts);
+        `);
+    }
+
+    executeCommand(rawLine, outputCallback) {
+        const trimmed = rawLine.trim();
+        if (!trimmed) return;
+
+        // Command History Logging
+        if (!kernel.env['IN_SEQUENCE']) {
+            this.history.push(trimmed);
+            this.vfs.writeFile('/', '/home/.bash_history', this.history.join('\n'));
+            this.historyIndex = this.history.length;
+        }
+
+        // Feature 1: Sequential Command Chaining (;)
+        if (trimmed.includes(';') && !trimmed.match(/['"][^'"]*;[^'"]*['"]/)) {
+            const commands = trimmed.split(';');
+            kernel.env['IN_SEQUENCE'] = 'true';
+            commands.forEach(cmd => this.executeCommand(cmd, outputCallback));
+            delete kernel.env['IN_SEQUENCE'];
+            return;
+        }
+
+        // Feature 2: Background Job execution (&)
+        if (trimmed.endsWith('&')) {
+            const backgroundCmd = trimmed.slice(0, -1).trim();
+            outputCallback(`[job spawned] executing background task context...`);
+            setTimeout(() => this.executeInternalLine(backgroundCmd, () => {}), 10);
+            return;
+        }
+
+        this.executeInternalLine(trimmed, outputCallback);
+    }
+
+    executeInternalLine(lineStr, outputCallback) {
+        let currentLine = lineStr.trim();
+
+        // Feature 3: File Descriptor Redirection (>)
+        let redirectFile = null;
+        if (currentLine.includes('>')) {
+            const rIdx = currentLine.indexOf('>');
+            redirectFile = currentLine.substring(rIdx + 1).trim();
+            currentLine = currentLine.substring(0, rIdx).trim();
+        }
+
+        // Feature 4: Structural Data Pipelines (|)
+        if (currentLine.includes('|')) {
+            const pipeSegments = currentLine.split('|').map(s => s.trim());
+            let bufferedOutput = '';
+            
+            // Execute segments sequentially, passing results through env tracking pipeline memory
+            for (let i = 0; i < pipeSegments.length; i++) {
+                if (bufferedOutput) { kernel.env['PIPE_INPUT'] = bufferedOutput; }
+                else { delete kernel.env['PIPE_INPUT']; }
+                
+                bufferedOutput = '';
+                this.executeInternalLine(pipeSegments[i], (chunk) => {
+                    if (chunk) bufferedOutput += (bufferedOutput ? '\n' : '') + chunk;
+                });
+            }
+            
+            delete kernel.env['PIPE_INPUT'];
+            
+            if (redirectFile) {
+                this.vfs.writeFile(this.env.PWD, redirectFile, bufferedOutput);
+            } else {
+                outputCallback(bufferedOutput);
+            }
+            return;
+        }
+
+        const tokens = currentLine.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
+        if (!tokens) return;
+        const cmdName = tokens[0];
+        const args = tokens.slice(1).map(arg => arg.replace(/^["']|["']$/g, ""));
+
+        if (cmdName === 'clear') {
+            document.getElementById('scrollback').innerHTML = ''; return;
+        }
+
+        const binPaths = this.env['PATH'].split(':');
+        let binSrc = null;
+        for (const p of binPaths) {
+            binSrc = this.vfs.readFile(p, cmdName); if (binSrc) break;
+        }
+
+        if (!binSrc) { outputCallback(`sys-err: command not found: ${cmdName}`); return; }
+
+        let interceptBuffer = '';
+        const targetOutputCallback = redirectFile ? (msg) => { if (msg) interceptBuffer += (interceptBuffer ? '\n' : '') + msg; } : outputCallback;
+
+        try {
+            const sandboxFunction = new Function('kernel', 'args', 'output', binSrc);
+            sandboxFunction(this, args, targetOutputCallback);
+            
+            if (redirectFile) {
+                this.vfs.writeFile(this.env.PWD, redirectFile, interceptBuffer);
+            }
+        } catch (err) {
+            outputCallback(`runtime-panic (${cmdName}): ${err.message}`);
+        }
+    }
+
+    getTabCompletion(partialStr) {
+        const tokens = partialStr.split(' ');
+        if (tokens.length === 1) {
+            const binPaths = this.env['PATH'].split(':');
+            let potentialMatches = [];
+            for (const path of binPaths) { potentialMatches.push(...(this.vfs.readdir('/', path) || [])); }
+            return { matches: potentialMatches.filter(c => c.startsWith(tokens[0])), prefix: tokens[0] };
+        }
+        return { matches: [], prefix: '' };
+    }
+}
+
+// --- TERMINAL DOM UI COUPLING ---
+const kernel = new Kernel();
+const scrollback = document.getElementById('scrollback');
+const cmdInput = document.getElementById('cmd-input');
+const promptSpan = document.getElementById('prompt');
+const cursor = document.getElementById('cursor');
+
+function updatePrompt() { promptSpan.textContent = `[${kernel.env.USER}@quantum-vfs:${kernel.env.PWD}]$ `; repositionCursor(); }
+function appendText(text) { if (!text) return; const div = document.createElement('div'); div.textContent = text; scrollback.appendChild(div); const c = document.getElementById('terminal-container'); c.scrollTop = c.scrollHeight; }
+function focusInput() { cmdInput.focus(); }
+function repositionCursor() { cursor.style.left = (cmdInput.value.length * 9.6) + "px"; }
+
+cmdInput.addEventListener('input', repositionCursor);
+cmdInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        const line = cmdInput.value; appendText(`${promptSpan.textContent}${line}`);
+        kernel.executeCommand(line, (out) => { if (out) appendText(out); });
+        cmdInput.value = ''; updatePrompt();
+    } 
+    else if (e.key === 'ArrowUp') {
+        if (kernel.history.length > 0 && kernel.historyIndex > 0) { kernel.historyIndex--; cmdInput.value = kernel.history[kernel.historyIndex]; repositionCursor(); }
+    } 
+    else if (e.key === 'ArrowDown') {
+        if (kernel.historyIndex < kernel.history.length - 1) { kernel.historyIndex++; cmdInput.value = kernel.history[kernel.historyIndex]; } 
+        else { kernel.historyIndex = kernel.history.length; cmdInput.value = ''; }
+        repositionCursor();
+    }
+});
+
+kernel.boot();
+updatePrompt();
+appendText("=====================================================================");
+appendText(" QUANTUM VFS REBOOTED: STREAM PROCESSING LAYERS ACTIVE [V10.3]");
+appendText("=====================================================================");
+
+setTimeout(() => {
+    const rc = kernel.vfs.readFile('/', '/etc/rc.local');
+    if (rc) {
+        rc.split('\n').forEach(line => {
+            let t = line.trim(); if (t && !t.startsWith('#') && !t.startsWith('echo')) kernel.executeInternalLine(t, appendText);
+        });
+    }
+    updatePrompt();
+}, 100);
+</script>
+</body>
+</html>

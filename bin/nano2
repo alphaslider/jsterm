@@ -1,0 +1,233 @@
+if(!args[0]) { output('Usage: nano2 [file1] [file2] ...'); return; }
+
+// IPC INTERCEPT: Append tabs live. If collapsed, auto-expand to show the new file.
+if (window.activeNano2) {
+    args.forEach(f => window.activeNano2.openFile(f));
+    return;
+}
+
+let files = [...args];
+const term = document.getElementById('terminal-container');
+
+// Enable smooth transitions for layout adjustments
+term.style.transition = 'width 0.3s ease-in-out';
+term.style.width = '50vw';
+
+// Split Panel Workspace Frame (Theme 2: High Contrast Black & White)
+const overlay = document.createElement('div');
+overlay.style.cssText = 'position:fixed;top:0;left:50vw;width:50vw;height:100vh;background:#000000;color:#ffffff;font-family:"VT323",monospace;display:flex;flex-direction:column;z-index:999999;border-left:2px solid #ffffff;box-sizing:border-box;text-shadow:none !important;transition:left 0.3s ease-in-out;';
+
+// Session State Tracking Matrices
+const sessions = {};
+files.forEach(f => {
+    const fileContent = kernel.vfs.readFile(kernel.env.PWD, f) || '';
+    sessions[f] = {
+        content: fileContent,
+        undoStack: []
+    };
+});
+let activeFile = files[0];
+
+// Tab Strip Element Layout Configuration
+const tabBar = document.createElement('div');
+tabBar.style.cssText = 'display:flex;background:#000000;border-bottom:2px solid #ffffff;flex-shrink:0;height:40px;align-items:stretch;overflow-x:auto;box-sizing:border-box;padding-left:10px;';
+
+function drawTabs() {
+    tabBar.innerHTML = '';
+    files.forEach(f => {
+        const tab = document.createElement('div');
+        tab.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:0 15px;cursor:pointer;border-right:1px solid #ffffff;font-size:18px;font-weight:bold;box-sizing:border-box;height:100%;white-space:nowrap;';
+        
+        if(f === activeFile) {
+            tab.style.background = '#ffffff';
+            tab.style.color = '#000000';
+        } else {
+            tab.style.background = '#000000';
+            tab.style.color = '#ffffff';
+        }
+        
+        // Text Content Label
+        const label = document.createElement('span');
+        label.innerText = f;
+        label.onclick = () => { changeTab(f); };
+        
+        // Dynamic Close Button Matrix Hook
+        const closeBtn = document.createElement('span');
+        closeBtn.innerText = '×';
+        closeBtn.style.cssText = 'margin-left:12px;font-size:20px;font-weight:bold;cursor:pointer;opacity:0.6;transition:none;display:inline-block;line-height:1;';
+        closeBtn.onmouseover = () => { closeBtn.style.opacity = '1'; closeBtn.style.color = '#ff3333'; };
+        closeBtn.onmouseout = () => { closeBtn.style.opacity = '0.6'; closeBtn.style.color = ''; };
+        closeBtn.onclick = (e) => {
+            e.stopPropagation(); // Avoid triggering tab selection context
+            discardTab(f);
+        };
+        
+        tab.append(label, closeBtn);
+        tabBar.appendChild(tab);
+    });
+}
+
+const editor = document.createElement('textarea');
+editor.style.cssText = 'flex:1;background:#000000;color:#ffffff;border:none;padding:14px;font-size:21px;font-family:inherit;outline:none;resize:none;line-height:1.3;box-sizing:border-box;';
+
+const bar = document.createElement('div');
+bar.style.cssText = 'border-top:2px solid #ffffff;padding:8px 12px;font-size:16px;background:#000000;flex-shrink:0;box-sizing:border-box;';
+
+function updateStatusBar(alertMsg = '') {
+    if (alertMsg) { bar.innerText = alertMsg; return; }
+    const undoCount = sessions[activeFile] ? sessions[activeFile].undoStack.length : 0;
+    bar.innerText = '^S Save File | ^X Discard Tab | ^Q Exit Workspace | ^Z Undo (' + undoCount + ') | ^U Clear Cache';
+}
+
+function changeTab(targetFile) {
+    if (sessions[activeFile]) {
+        sessions[activeFile].content = editor.value;
+    }
+    activeFile = targetFile;
+    editor.value = sessions[activeFile].content;
+    lastTrackedValue = editor.value;
+    drawTabs();
+    updateStatusBar();
+    if (!isCollapsed) editor.focus();
+}
+
+// Global Tab Destruction Pipeline
+function discardTab(targetFile) {
+    files = files.filter(f => f !== targetFile);
+    delete sessions[targetFile];
+
+    // Out of files? Clean up workspace execution completely
+    if (files.length === 0) {
+        closeWorkspace();
+        output('All open tabs closed. Workspace session terminated.');
+        return;
+    }
+
+    // Handshake focused view parameters over to remaining tab blocks
+    if (activeFile === targetFile) {
+        changeTab(files[0]);
+    } else {
+        drawTabs();
+        updateStatusBar();
+    }
+}
+
+// --- SMART SLIDE ENGINE (PLUS / MINUS INTERFACE) ---
+let isCollapsed = false;
+const toggleBtn = document.createElement('div');
+toggleBtn.style.cssText = 'position:absolute;left:-37px;top:45px;width:35px;height:35px;background:#000000;color:#ffffff;border:2px solid #ffffff;border-right:none;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:20px;font-weight:bold;z-index:999999;box-sizing:border-box;user-select:none;';
+toggleBtn.innerText = '—';
+
+toggleBtn.onclick = (e) => {
+    e.stopPropagation();
+    if (isCollapsed) {
+        overlay.style.left = '50vw';
+        term.style.width = '50vw';
+        toggleBtn.innerText = '—';
+        setTimeout(() => editor.focus(), 300);
+    } else {
+        overlay.style.left = '100vw';
+        term.style.width = '100%';
+        toggleBtn.innerText = '+';
+        document.getElementById('cmd-input').focus();
+    }
+    isCollapsed = !isCollapsed;
+};
+overlay.appendChild(toggleBtn);
+
+// Expose IPC Hooks globally
+window.activeNano2 = {
+    openFile: (f) => {
+        if (!files.includes(f)) {
+            files.push(f);
+            const fileContent = kernel.vfs.readFile(kernel.env.PWD, f) || '';
+            sessions[f] = { content: fileContent, undoStack: [] };
+        }
+        changeTab(f);
+        if (isCollapsed) {
+            toggleBtn.click();
+        }
+    }
+};
+
+overlay.append(tabBar, editor, bar);
+document.body.appendChild(overlay);
+
+// Initial Context Hydration
+editor.value = sessions[activeFile].content;
+drawTabs();
+updateStatusBar();
+editor.focus();
+
+// Disaster Recovery History Mapping
+let lastTrackedValue = editor.value;
+let undoDebounceTimer;
+
+editor.oninput = () => {
+    const currentVal = editor.value;
+    const currentSession = sessions[activeFile];
+    if (!currentSession) return;
+    
+    clearTimeout(undoDebounceTimer);
+    undoDebounceTimer = setTimeout(() => {
+        if (currentSession.undoStack.length === 0 || currentSession.undoStack[currentSession.undoStack.length - 1] !== lastTrackedValue) {
+            currentSession.undoStack.push(lastTrackedValue);
+            lastTrackedValue = currentVal;
+            updateStatusBar();
+        }
+    }, 400);
+};
+
+// Keyboard Matrices Configuration
+const handleKeyboardIntercepts = (e) => {
+    if (isCollapsed && e.target === editor) return;
+
+    if (e.ctrlKey && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        kernel.vfs.writeFile(kernel.env.PWD, activeFile, editor.value);
+        sessions[activeFile].content = editor.value;
+        updateStatusBar('[ SUCCESS: TARGET FILE DESCRIPTOR FLUSHED ]');
+        setTimeout(() => updateStatusBar(), 1000);
+    }
+    if (e.ctrlKey && e.key.toLowerCase() === 'x') {
+        e.preventDefault();
+        discardTab(activeFile);
+    }
+    if (e.ctrlKey && e.key.toLowerCase() === 'q') {
+        e.preventDefault();
+        closeWorkspace();
+        output('Workspace assembly dropped.');
+    }
+    if (e.ctrlKey && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        const activeSession = sessions[activeFile];
+        if (activeSession && activeSession.undoStack.length > 0) {
+            editor.value = activeSession.undoStack.pop();
+            lastTrackedValue = editor.value;
+            activeSession.content = editor.value;
+            updateStatusBar();
+        } else {
+            updateStatusBar('[ NOTICE: HISTORY UNDO REGISTER CLEAR ]');
+            setTimeout(() => updateStatusBar(), 1000);
+        }
+    }
+    if (e.ctrlKey && e.key.toLowerCase() === 'u') {
+        e.preventDefault();
+        if (sessions[activeFile]) {
+            sessions[activeFile].undoStack = [];
+            updateStatusBar('[ MEMORY CLEARED: UNDO CACHE ZEROED ]');
+            setTimeout(() => updateStatusBar(), 1000);
+        }
+    }
+};
+
+function closeWorkspace() {
+    delete window.activeNano2;
+    overlay.remove();
+    term.style.transition = 'none';
+    term.style.width = '100%';
+    window.removeEventListener('keydown', handleKeyboardIntercepts);
+    document.getElementById('cmd-input').focus();
+}
+
+window.addEventListener('keydown', handleKeyboardIntercepts);

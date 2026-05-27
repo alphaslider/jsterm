@@ -1,0 +1,428 @@
+// Full Screen Triple Pillar Workbench Architecture (Monochrome Black & White V10.3 Compliant)
+const term = document.getElementById('terminal-container');
+term.style.width = '0vw'; // Cleanly collapse the terminal view context
+
+const masterContainer = document.createElement('div');
+masterContainer.id = 'mc2-workspace';
+masterContainer.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:#000000;color:#ffffff;font-family:"VT323",monospace;display:flex;flex-direction:column;z-index:999999;box-sizing:border-box;text-shadow:none;';
+
+// Global System Registries
+let clipboard = [];
+let activeEditorFile = null;
+let editorFiles = [];
+const editorSessions = {};
+
+// Track separate working directories for left and right pillars
+const pillarPaths = {
+    'pillar-panel-0': kernel.env.PWD || '/',
+    'pillar-panel-1': kernel.env.PWD || '/'
+};
+
+// --- V10.3 NATIVE PATH RESOLUTION ENGINE ---
+function getVfsItems(dirPath) {
+    try {
+        const rawItems = kernel.vfs.readdir(dirPath, '.') || [];
+        return rawItems.map(name => {
+            const node = kernel.vfs.getNode(dirPath, name);
+            
+            // Strict VFS Folder Structure Identification
+            let isDir = false;
+            if (node && typeof node === 'object') {
+                if (node.type === 'directory') {
+                    isDir = true;
+                } else if ('content' in node) {
+                    isDir = false; // It has a file content string field (even if empty)
+                } else {
+                    isDir = true; // No file content signature field -> structural directory object
+                }
+            }
+            
+            return {
+                name: name,
+                type: isDir ? 'directory' : 'file'
+            };
+        });
+    } catch (e) {
+        return [];
+    }
+}
+
+// --- TOP SYSTEM BAR (GLOBAL UTILITIES ONLY) ---
+const globalHeader = document.createElement('div');
+globalHeader.style.cssText = 'display:flex;background:#ffffff;color:#000000;padding:8px;justify-content:space-between;flex-shrink:0;align-items:center;font-weight:bold;border-bottom:2px solid #ffffff;';
+
+const sysTitle = document.createElement('span');
+sysTitle.innerText = 'MC2 TRIPLE PILLAR WORKBENCH V10.3 [MONO-MODE]';
+sysTitle.style.cssText = 'font-size:18px;padding-left:10px;';
+
+const quitBtn = document.createElement('button');
+quitBtn.innerText = '[ ESC Quit MC2 ]';
+quitBtn.style.cssText = 'background:#000000;color:#ffffff;border:1px solid #ffffff;font-family:inherit;font-size:14px;padding:2px 10px;cursor:pointer;font-weight:bold;';
+quitBtn.onmouseover = () => { quitBtn.style.background = '#ffffff'; quitBtn.style.color = '#000000'; };
+quitBtn.onmouseout = () => { quitBtn.style.background = '#000000'; quitBtn.style.color = '#ffffff'; };
+quitBtn.onclick = () => closeWorkspace();
+
+globalHeader.append(sysTitle, quitBtn);
+masterContainer.appendChild(globalHeader);
+
+// --- THREE WORKSPACE PILLARS HORIZON MAPPING ---
+const pillarContainer = document.createElement('div');
+pillarContainer.style.cssText = 'display:flex;flex:1;width:100vw;overflow:hidden;background:#000000;';
+
+const pillarLeft = document.createElement('div');
+const pillarRight = document.createElement('div');
+const pillarEditor = document.createElement('div');
+
+[pillarLeft, pillarRight].forEach((p, idx) => {
+    p.id = `pillar-panel-${idx}`;
+    p.style.cssText = 'flex:1;border-right:2px solid #ffffff;display:flex;flex-direction:column;overflow:hidden;box-sizing:border-box;';
+});
+pillarEditor.style.cssText = 'flex:1.4;display:flex;flex-direction:column;overflow:hidden;box-sizing:border-box;';
+
+pillarContainer.append(pillarLeft, pillarRight, pillarEditor);
+masterContainer.appendChild(pillarContainer);
+
+// --- TOP ALIGNED TAB STRIP ASSEMBLY (MAPPED TO PILLAR TOP LEVEL) ---
+const tabStrip = document.createElement('div');
+tabStrip.style.cssText = 'display:flex;background:#000000;border-bottom:1px solid #ffffff;flex-shrink:0;height:34px;align-items:stretch;overflow-x:auto;box-sizing:border-box;';
+
+const textEngine = document.createElement('textarea');
+textEngine.style.cssText = 'flex:1;background:#000000;color:#ffffff;border:none;padding:14px;font-size:21px;font-family:inherit;outline:none;resize:none;line-height:1.3;box-sizing:border-box;';
+
+const statusStrip = document.createElement('div');
+statusStrip.style.cssText = 'border-top:2px solid #ffffff;padding:8px 12px;font-size:17px;background:#ffffff;color:#000000;flex-shrink:0;box-sizing:border-box;font-weight:bold;';
+
+// Append components sequentially ensuring tab engine mirrors panel action layout height
+pillarEditor.append(tabStrip, textEngine, statusStrip);
+
+// --- LOCAL PILLAR CONTROL COMPONENT GENERATOR ---
+function createPillarBtn(text, action) {
+    const btn = document.createElement('button');
+    btn.innerText = text;
+    btn.style.cssText = 'background:#000000;color:#ffffff;border:1px solid #ffffff;font-family:inherit;font-size:14px;padding:2px 8px;cursor:pointer;font-weight:bold;';
+    btn.onmouseover = () => { btn.style.background = '#ffffff'; btn.style.color = '#000000'; };
+    btn.onmouseout = () => { btn.style.background = '#000000'; btn.style.color = '#ffffff'; };
+    btn.onclick = action;
+    return btn;
+}
+
+// --- NATIVE DRAG, DROP, AND RENDERING PIPELINE ---
+function renderPanel(panelElement) {
+    panelElement.innerHTML = '';
+    const panelId = panelElement.id;
+    const currentPath = pillarPaths[panelId];
+
+    // Header displaying the absolute path
+    const pHeader = document.createElement('div');
+    pHeader.style.cssText = 'background:#ffffff;color:#000000;padding:6px;font-weight:bold;font-size:16px;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:0.5px;height:34px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;';
+    pHeader.innerText = `DIR: ${currentPath}`;
+    panelElement.appendChild(pHeader);
+
+    // Contextual actions array attached directly to the local pillar
+    const pActionBar = document.createElement('div');
+    pActionBar.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;padding:6px;background:#000000;border-bottom:1px solid #ffffff;';
+    
+    pActionBar.append(
+        createPillarBtn('Copy', () => executePillarBatch(panelId, 'copy')),
+        createPillarBtn('Paste', () => executePillarBatch(panelId, 'paste')),
+        createPillarBtn('Rename', () => executePillarSingle(panelId, 'rename')),
+        createPillarBtn('Delete', () => executePillarBatch(panelId, 'delete')),
+        createPillarBtn('New File', () => executePillarSingle(panelId, 'newfile'))
+    );
+    panelElement.appendChild(pActionBar);
+
+    const listBody = document.createElement('div');
+    listBody.style.cssText = 'flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:4px;background:#000000;';
+    
+    // HTML5 Cross-Directory Batch/Single Drop Handler
+    listBody.ondragover = (e) => e.preventDefault();
+    listBody.ondrop = (e) => {
+        e.preventDefault();
+        try {
+            const data = JSON.parse(e.dataTransfer.getData('text/plain'));
+            if (data.sourcePanelId !== panelId) {
+                const sourceDir = data.sourcePath;
+                const destDir = currentPath;
+                
+                // Process item array transaction payload
+                data.items.forEach(item => {
+                    if (item.type === 'file') {
+                        const content = kernel.vfs.readFile(sourceDir, item.name) || '';
+                        kernel.vfs.writeFile(destDir, item.name, content);
+                        kernel.vfs.rm(sourceDir, item.name);
+                    } else if (item.type === 'directory') {
+                        kernel.vfs.mkdir(destDir, item.name);
+                        kernel.vfs.rm(sourceDir, item.name);
+                    }
+                });
+                
+                refreshAllPanels();
+                updateEditorStatus(`[ MOVED: ${data.items.length} NODES REALLOCATED TO ${destDir} ]`);
+            }
+        } catch(err) {}
+    };
+
+    // Render navigation link back to Parent Directory
+    if (currentPath !== '/' && currentPath !== '') {
+        const upRow = document.createElement('div');
+        upRow.style.cssText = 'display:flex;align-items:center;padding:4px 6px;cursor:pointer;font-size:18px;font-weight:bold;color:#ffffff;text-decoration:underline;';
+        upRow.innerText = '[..] PARENT DIRECTORY';
+        upRow.onclick = () => {
+            const segments = currentPath.split('/').filter(Boolean);
+            segments.pop();
+            const nextPath = '/' + segments.join('/');
+            pillarPaths[panelId] = nextPath === '' ? '/' : nextPath;
+            renderPanel(panelElement);
+        };
+        listBody.appendChild(upRow);
+    }
+
+    const items = getVfsItems(currentPath);
+    items.forEach(item => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;padding:6px;border:1px solid transparent;cursor:grab;user-select:none;font-size:19px;color:#ffffff;';
+        row.setAttribute('draggable', 'true');
+
+        row.onmouseover = () => { row.style.border = '1px solid #ffffff'; row.style.background = '#ffffff'; row.style.color = '#000000'; };
+        row.onmouseout = () => { row.style.border = '1px solid transparent'; row.style.background = 'transparent'; row.style.color = '#ffffff'; };
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = `${panelId}-batch-check`;
+        checkbox.dataset.name = item.name;
+        checkbox.dataset.type = item.type;
+        checkbox.style.cssText = 'margin-right:12px;cursor:pointer;width:16px;height:16px;accent-color:#ffffff;outline:none;border:1px solid #ffffff;';
+        checkbox.onclick = (e) => e.stopPropagation();
+
+        row.ondragstart = (e) => {
+            let dragPayload = [];
+            
+            // If dragging an element that is already checked, fetch all checked items
+            if (checkbox.checked) {
+                dragPayload = getCheckedPillarFiles(panelId);
+            } else {
+                // Otherwise fall back to a single targeted element transaction package
+                dragPayload = [{ name: item.name, type: item.type }];
+            }
+
+            e.dataTransfer.setData('text/plain', JSON.stringify({
+                sourcePanelId: panelId,
+                sourcePath: currentPath,
+                items: dragPayload
+            }));
+        };
+
+        row.ondblclick = () => {
+            if (item.type === 'directory') {
+                const targetPath = currentPath === '/' ? `/${item.name}` : `${currentPath}/${item.name}`;
+                pillarPaths[panelId] = targetPath;
+                renderPanel(panelElement);
+            } else {
+                openFileInEditor(currentPath, item.name);
+            }
+        };
+
+        const typeIndicator = document.createElement('span');
+        typeIndicator.innerText = item.type === 'directory' ? '[DIR] ' : '[BIN] ';
+        typeIndicator.style.cssText = 'font-size:14px;font-family:monospace;margin-right:8px;';
+
+        const label = document.createElement('span');
+        label.innerText = item.type === 'directory' ? `[ ${item.name} ]` : item.name;
+        label.style.cssText = item.type === 'directory' ? 'font-weight:bold;' : 'font-weight:normal;';
+
+        row.append(checkbox, typeIndicator, label);
+        listBody.appendChild(row);
+    });
+
+    panelElement.appendChild(listBody);
+}
+
+function refreshAllPanels() {
+    renderPanel(pillarLeft);
+    renderPanel(pillarRight);
+}
+
+function drawEditorTabs() {
+    tabStrip.innerHTML = '';
+    editorFiles.forEach(f => {
+        const tab = document.createElement('div');
+        tab.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:0 15px;cursor:pointer;border-right:1px solid #ffffff;font-size:17px;font-weight:bold;box-sizing:border-box;height:100%;white-space:nowrap;';
+        
+        if (f.pathAndName === activeEditorFile) {
+            tab.style.background = '#ffffff';
+            tab.style.color = '#000000';
+        } else {
+            tab.style.background = '#000000';
+            tab.style.color = '#ffffff';
+        }
+
+        const lbl = document.createElement('span');
+        lbl.innerText = f.name;
+        lbl.onclick = () => selectEditorTab(f.pathAndName);
+
+        const closeBtn = document.createElement('span');
+        closeBtn.innerText = 'x';
+        closeBtn.style.cssText = 'margin-left:10px;font-size:19px;font-weight:bold;cursor:pointer;line-height:1;';
+        closeBtn.onclick = (e) => {
+            e.stopPropagation();
+            closeEditorTab(f.pathAndName);
+        };
+
+        tab.append(lbl, closeBtn);
+        tabStrip.appendChild(tab);
+    });
+}
+
+function updateEditorStatus(msg = '') {
+    if (msg) { statusStrip.innerText = msg; return; }
+    statusStrip.innerText = activeEditorFile ? `[ EDITING: ${activeEditorFile} ] Ctrl+S Synced Matrix File System` : '[ STANDBY CORE ] Double-click VFS file entries to edit contents';
+}
+
+// --- BUFFER TRANSFERS ---
+function openFileInEditor(dirPath, filename) {
+    const lookupKey = dirPath === '/' ? `/${filename}` : `${dirPath}/${filename}`;
+    if (!editorFiles.some(f => f.pathAndName === lookupKey)) {
+        editorFiles.push({ pathAndName: lookupKey, name: filename, dir: dirPath });
+        const content = kernel.vfs.readFile(dirPath, filename) || '';
+        editorSessions[lookupKey] = { content: content, dir: dirPath, name: filename };
+    }
+    selectEditorTab(lookupKey);
+}
+
+function selectEditorTab(lookupKey) {
+    if (activeEditorFile && editorSessions[activeEditorFile]) {
+        editorSessions[activeEditorFile].content = textEngine.value;
+    }
+    activeEditorFile = lookupKey;
+    textEngine.value = editorSessions[lookupKey].content;
+    drawEditorTabs();
+    updateEditorStatus();
+    textEngine.focus();
+}
+
+function closeEditorTab(lookupKey) {
+    if (activeEditorFile === lookupKey) {
+        activeEditorFile = null;
+        textEngine.value = '';
+    }
+    editorFiles = editorFiles.filter(f => f.pathAndName !== lookupKey);
+    delete editorSessions[lookupKey];
+    
+    if (editorFiles.length > 0) {
+        selectEditorTab(editorFiles[0].pathAndName);
+    } else {
+        drawEditorTabs();
+        updateEditorStatus();
+    }
+}
+
+textEngine.oninput = () => {
+    if (activeEditorFile && editorSessions[activeEditorFile]) {
+        editorSessions[activeEditorFile].content = textEngine.value;
+    }
+};
+
+// --- CONTROLLER PIPELINE TRANSACTIONS ---
+function getCheckedPillarFiles(panelId) {
+    const checkedBoxes = masterContainer.querySelectorAll(`.${panelId}-batch-check:checked`);
+    return Array.from(checkedBoxes).map(box => ({
+        name: box.dataset.name,
+        type: box.dataset.type
+    }));
+}
+
+// --- COMMAND EXECUTION SYSTEM ROUTINES ---
+function executePillarBatch(panelId, type) {
+    const currentPath = pillarPaths[panelId];
+    const selected = getCheckedPillarFiles(panelId);
+    
+    if (type === 'copy') {
+        if (selected.length === 0) { updateEditorStatus('[ ERROR: NO PILLAR NODES CHECKED ]'); return; }
+        clipboard = selected.filter(item => item.type === 'file').map(item => ({
+            filename: item.name,
+            content: kernel.vfs.readFile(currentPath, item.name) || ''
+        }));
+        updateEditorStatus(`[ SUCCESS: ${clipboard.length} FILES STACKED IN SYSTEM BUFFER ]`);
+    } 
+    else if (type === 'paste') {
+        if (clipboard.length === 0) { updateEditorStatus('[ ERROR: SYS MEMORY REGISTERS EMPTY ]'); return; }
+        clipboard.forEach(item => {
+            kernel.vfs.writeFile(currentPath, item.filename, item.content);
+        });
+        updateEditorStatus(`[ SUCCESS: REPLICATED FILES TO ${currentPath} ]`);
+        refreshAllPanels();
+    } 
+    else if (type === 'delete') {
+        if (selected.length === 0) { updateEditorStatus('[ ERROR: NO PURGE TARGETS DECLARED ]'); return; }
+        selected.forEach(item => {
+            kernel.vfs.rm(currentPath, item.name);
+            const lookupKey = currentPath === '/' ? `/${item.name}` : `${currentPath}/${item.name}`;
+            closeEditorTab(lookupKey);
+        });
+        updateEditorStatus('[ SUCCESS: FILES PURGED FROM TARGET DIRECTORY ]');
+        refreshAllPanels();
+    }
+}
+
+function executePillarSingle(panelId, type) {
+    const currentPath = pillarPaths[panelId];
+    const selected = getCheckedPillarFiles(panelId);
+    
+    if (type === 'rename') {
+        if (selected.length !== 1) { updateEditorStatus('[ REJECTED: CHOOSE EXACTLY 1 ITEM ]'); return; }
+        const oldName = selected[0].name;
+        const newName = prompt(`Modify item structural handle for: ${oldName}`, oldName);
+        if (newName && newName !== oldName) {
+            if (selected[0].type === 'file') {
+                const content = kernel.vfs.readFile(currentPath, oldName) || '';
+                kernel.vfs.writeFile(currentPath, newName, content);
+                kernel.vfs.rm(currentPath, oldName);
+                
+                const oldLookupKey = currentPath === '/' ? `/${oldName}` : `${currentPath}/${oldName}`;
+                if (editorSessions[oldLookupKey]) {
+                    closeEditorTab(oldLookupKey);
+                    openFileInEditor(currentPath, newName);
+                }
+            } else {
+                kernel.vfs.mkdir(currentPath, newName);
+                kernel.vfs.rm(currentPath, oldName);
+            }
+            refreshAllPanels();
+            updateEditorStatus('[ SUCCESS: TRANSACTION COMPLETED ]');
+        }
+    } 
+    else if (type === 'newfile') {
+        const newFileName = prompt('Specify structural handle name for new file node:', 'unnamed.txt');
+        if (newFileName) {
+            kernel.vfs.writeFile(currentPath, newFileName, '');
+            refreshAllPanels();
+            openFileInEditor(currentPath, newFileName);
+        }
+    }
+}
+
+const masterGlobalKeyHooks = (e) => {
+    if (e.ctrlKey && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        if (activeEditorFile && editorSessions[activeEditorFile]) {
+            const session = editorSessions[activeEditorFile];
+            kernel.vfs.writeFile(session.dir, session.name, textEngine.value);
+            updateEditorStatus('[ SUCCESS: COMPONENT SECTOR BUFFERS FLUSHED ]');
+            setTimeout(() => updateEditorStatus(), 1000);
+        }
+    }
+};
+
+function closeWorkspace() {
+    masterContainer.remove();
+    term.style.width = '100vw'; 
+    window.removeEventListener('keydown', masterGlobalKeyHooks);
+    document.getElementById('cmd-input').focus();
+    output('MC2 runtime context collapsed. Native terminal frame active.');
+}
+
+// System Frame Initialization
+document.body.appendChild(masterContainer);
+window.addEventListener('keydown', masterGlobalKeyHooks);
+refreshAllPanels();
+updateEditorStatus();

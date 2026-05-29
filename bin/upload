@@ -1,0 +1,42 @@
+
+// /bin/upload - VFS File Ingestion Utility
+const input = document.createElement('input');
+input.type = 'file';
+input.multiple = true; // Allow batch uploading
+input.accept = '.zip,.mp3,.wav,.html,.js,.txt';
+
+input.onchange = async (e) => {
+    const files = e.target.files;
+    if (!files.length) {
+        output('Upload cancelled.');
+        return;
+    }
+
+    output(`Starting upload of ${files.length} file(s) to ${kernel.env.PWD}...`);
+
+    for (let file of files) {
+        const isText = file.name.match(/\.(html|js|txt|md|css|json|csv)$/i) || file.type.startsWith('text/');
+        
+        const content = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onload = (ev) => resolve(ev.target.result);
+            
+            if (isText) {
+                // Read text-based files as raw strings for the editor
+                reader.readAsText(file);
+            } else {
+                // Read binary files (audio, zip) as Base64 to safely store in VFS
+                reader.readAsDataURL(file);
+            }
+        });
+
+        // Write to current working directory
+        kernel.vfs.writeFile(kernel.env.PWD, file.name, content);
+        output(`+ ${file.name} (${isText ? 'Text' : 'Binary Base64'})`);
+    }
+    
+    output('Upload complete.');
+};
+
+// Trigger the native OS file picker
+input.click();
